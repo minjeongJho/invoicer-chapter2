@@ -246,3 +246,105 @@ func getVersion(w http.ResponseWriter, r *http.Request) {
 "build": "https://circleci.com/gh/Securing-DevOps/invoicer/"
 }`, version, commit)))
 }
+
+func httpError(w http.ResponseWriter, errorCode int, errorMessage string, args ...interface{}) {
+	log.Printf("%d: %s", errorCode, fmt.Sprintf(errorMessage, args...))
+	http.Error(w, fmt.Sprintf(errorMessage, args...), errorCode)
+	return
+}
+
+var CSRFKey []byte
+
+func makeCSRFToken() string {
+	msg := make([]byte, 32)
+	rand.Read(msg)
+	mac := hmac.New(sha256.New, CSRFKey)
+	mac.Write(msg)
+	return base64.StdEncoding.EncodeToString(msg) + `$` + base64.StdEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func checkCSRFToken(token string) bool {
+	mac := hmac.New(sha256.New, CSRFKey)
+	tokenParts := strings.Split(token, "$")
+	if len(tokenParts) != 2 {
+		return false
+	}
+	msg, _ := base64.StdEncoding.DecodeString(tokenParts[0])
+	messageMAC, _ := base64.StdEncoding.DecodeString(tokenParts[1])
+	mac.Write([]byte(msg))
+	expectedMAC := mac.Sum(nil)
+	return hmac.Equal(messageMAC, expectedMAC)
+}
+
+var oauthCfg = &oauth2.Config{
+	ClientID:     "606479880714-v36tg6qtn9alsinbvfb0qtmvjdkunq4c.apps.googleusercontent.com",
+	ClientSecret: "ySBC6T-F31ez3qsA3lnNRvtr",
+	RedirectURL:  "http://localhost:8080/oauth2callback",
+	Scopes:       []string{"https://www.googleapis.com/auth/userinfo.profile"},
+	Endpoint: oauth2.Endpoint{
+		AuthURL:  "https://accounts.google.com/o/oauth2/auth",
+		TokenURL: "https://accounts.google.com/o/oauth2/token",
+	},
+}
+
+func (iv *invoicer) getAuthenticate(w http.ResponseWriter, r *http.Request) {
+	//Get the Google URL which shows the Authentication page to the user
+	url := oauthCfg.AuthCodeURL(makeCSRFToken())
+	//redirect user to that page
+	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
+}
+
+// Function that handles the callback from the IDP
+func (iv *invoicer) getOAuth2Callback(w http.ResponseWriter, r *http.Request) {
+	if !checkCSRFToken(r.FormValue("state")) {
+		w.WriteHeader(http.StatusNotAcceptable)
+		w.Write([]byte("Failed to verify oauth state via CSRF token '" + r.FormValue("state") + "'"))
+		return
+	}
+	token, err := oauthCfg.Exchange(oauth2.NoContext, r.FormValue("code"))
+	if err != nil {
+		w.WriteHeader(http.StatusNotAcceptable)
+		w.Write([]byte("Failed to obtain token from oauth code " + r.FormValue("code")))
+		return
+	}
+
+	client := oauthCfg.Client(oauth2.NoContext, token)
+	resp, err := client.Get(`https://www.googleapis.com/oauth2/v1/userinfo?alt=json`)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("Failed to retrieve user information from IDP"))
+		return
+	}
+	buf := make([]byte, 10240)
+	resp.Body.Read(buf)
+	fmt.Printf("%s\n", buf)
+	var up UserProfile
+	//err = json.Unmarshal(buf, &up)
+	//if err != nil {
+	//	w.WriteHeader(http.StatusExpectationFailed)
+	//	w.Write([]byte("Failed to parse user information from " + string(buf)))
+	//	return
+	//}
+
+	// Create a session, save it and return a cookie
+	session, err := iv.store.Get(r, "session")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("Failed to create session for user"))
+		return
+	}
+	sid := makeCSRFToken()
+	session.Values[up.Name] = sid
+	iv.store.Save(r, w, session)
+
+	w.Write([]byte(fmt.Sprintf(`<html><body>
+This app is now authenticated to access your Google user info.  Your details are:<br />
+%s
+<img src="%s" />
+</body></html>`, up.Name, up.Picture)))
+}
+
+type UserProfile struct {
+	Name    string `json:"name"`
+	Picture string `json:"picture"`
+}
